@@ -156,13 +156,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const isMainGroup = group.isMain === true;
 
   const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-  const missedMessages = getMessagesSince(
-    chatJid,
-    sinceTimestamp,
-    ASSISTANT_NAME,
-  );
+  let missedMessages = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
 
   if (missedMessages.length === 0) return true;
+
+  // Backlog safety: If we have an overwhelming number of missed messages,
+  // skip the old ones and only process the most recent context to avoid
+  // exploding the Token count (TPM) and hitting 429 errors.
+  if (missedMessages.length > 50) {
+    logger.warn(
+      { jid: chatJid, totalMissed: missedMessages.length },
+      'Backlog too large, truncating to most recent 10 messages'
+    );
+    missedMessages = missedMessages.slice(-10);
+  }
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {

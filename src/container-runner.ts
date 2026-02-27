@@ -6,6 +6,8 @@ import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
+import { readEnvFile } from './env.js';
+
 import {
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
@@ -41,6 +43,7 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  secrets?: Record<string, string>;
 }
 
 export interface ContainerOutput {
@@ -178,20 +181,10 @@ function buildVolumeMounts(
   // Copy agent-runner source into a per-group writable location so agents
   // can customize it (add tools, change behavior) without affecting other
   // groups. Recompiled on container startup via entrypoint.sh.
-  const agentRunnerSrc = path.join(
-    projectRoot,
-    'container',
-    'agent-runner',
-    'src',
-  );
-  const groupAgentRunnerDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    'agent-runner-src',
-  );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+  const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');
+  const groupAgentRunnerDir = path.join(DATA_DIR, 'sessions', group.folder, 'agent-runner-src');
+  if (fs.existsSync(agentRunnerSrc)) {
+    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true, force: true });
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
@@ -210,6 +203,14 @@ function buildVolumeMounts(
   }
 
   return mounts;
+}
+
+/**
+ * Read allowed secrets from .env for passing to the container via stdin.
+ * Secrets are never written to disk or mounted as files.
+ */
+function readSecrets(): Record<string, string> {
+  return readEnvFile(['GOOGLE_API_KEY', 'NANO_MODEL']);
 }
 
 function buildContainerArgs(
@@ -318,7 +319,7 @@ export async function runContainerAgent(
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
-    container.stdin.write(JSON.stringify(input));
+    container.stdin.write(JSON.stringify({ ...input, secrets: readSecrets() }));
     container.stdin.end();
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive

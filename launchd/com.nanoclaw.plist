@@ -6,11 +6,11 @@
     <string>com.nanoclaw</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{{NODE_PATH}}</string>
-        <string>{{PROJECT_ROOT}}/dist/index.js</string>
+        <string>/Users/johnsontsai/.nvm/versions/node/v24.12.0/bin/node</string>
+        <string>/Volumes/DevDisk/nanoclaw/dist/index.js</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>{{PROJECT_ROOT}}</string>
+    <string>/Volumes/DevDisk/nanoclaw</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -18,15 +18,15 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>{{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/Users/johnsontsai/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
-        <string>{{HOME}}</string>
+        <string>/Users/johnsontsai</string>
         <key>ASSISTANT_NAME</key>
-        <string>Andy</string>
+        <string>Dart</string>
     </dict>
     <key>StandardOutPath</key>
-    <string>{{PROJECT_ROOT}}/logs/nanoclaw.log</string>
+    <string>/Volumes/DevDisk/nanoclaw/logs/nanoclaw.log</string>
     <key>StandardErrorPath</key>
-    <string>{{PROJECT_ROOT}}/logs/nanoclaw.error.log</string>
+    <string>/Volumes/DevDisk/nanoclaw/logs/nanoclaw.error.log</string>
 </dict>
 </plist>

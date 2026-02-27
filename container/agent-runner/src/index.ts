@@ -1,23 +1,22 @@
 /**
- * NanoClaw Agent Runner
- * Runs inside a container, receives config via stdin, outputs result to stdout
+ * NanoClaw Agent Runner — Gemini Backend
+ * Runs inside a container, receives config via stdin, outputs result to stdout.
  *
  * Input protocol:
- *   Stdin: Full ContainerInput JSON (read until EOF, like before)
+ *   Stdin: Full ContainerInput JSON (read until EOF)
  *   IPC:   Follow-up messages written as JSON files to /workspace/ipc/input/
  *          Files: {type:"message", text:"..."}.json — polled and consumed
  *          Sentinel: /workspace/ipc/input/_close — signals session end
  *
  * Stdout protocol:
  *   Each result is wrapped in OUTPUT_START_MARKER / OUTPUT_END_MARKER pairs.
- *   Multiple results may be emitted (one per agent teams result).
+ *   Multiple results may be emitted (one per IPC turn).
  *   Final marker after loop ends signals completion.
  */
 
 import fs from 'fs';
 import path from 'path';
-import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
-import { fileURLToPath } from 'url';
+import { GeminiProvider } from './providers/gemini.provider.js';
 
 interface ContainerInput {
   prompt: string;
@@ -27,6 +26,7 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  secrets?: Record<string, string>;
 }
 
 interface ContainerOutput {
@@ -36,76 +36,14 @@ interface ContainerOutput {
   error?: string;
 }
 
-interface SessionEntry {
-  sessionId: string;
-  fullPath: string;
-  summary: string;
-  firstPrompt: string;
-}
-
-interface SessionsIndex {
-  entries: SessionEntry[];
-}
-
-interface SDKUserMessage {
-  type: 'user';
-  message: { role: 'user'; content: string };
-  parent_tool_use_id: null;
-  session_id: string;
-}
-
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 
-/**
- * Push-based async iterable for streaming user messages to the SDK.
- * Keeps the iterable alive until end() is called, preventing isSingleUserTurn.
- */
-class MessageStream {
-  private queue: SDKUserMessage[] = [];
-  private waiting: (() => void) | null = null;
-  private done = false;
-
-  push(text: string): void {
-    this.queue.push({
-      type: 'user',
-      message: { role: 'user', content: text },
-      parent_tool_use_id: null,
-      session_id: '',
-    });
-    this.waiting?.();
-  }
-
-  end(): void {
-    this.done = true;
-    this.waiting?.();
-  }
-
-  async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage> {
-    while (true) {
-      while (this.queue.length > 0) {
-        yield this.queue.shift()!;
-      }
-      if (this.done) return;
-      await new Promise<void>(r => { this.waiting = r; });
-      this.waiting = null;
-    }
-  }
-}
-
-async function readStdin(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let data = '';
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', chunk => { data += chunk; });
-    process.stdin.on('end', () => resolve(data));
-    process.stdin.on('error', reject);
-  });
-}
-
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+const MAX_HISTORY_TURNS = 20; // Keep context concise to save quota
 
 function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_START_MARKER);
@@ -117,145 +55,14 @@ function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
 }
 
-function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
-  const projectDir = path.dirname(transcriptPath);
-  const indexPath = path.join(projectDir, 'sessions-index.json');
-
-  if (!fs.existsSync(indexPath)) {
-    log(`Sessions index not found at ${indexPath}`);
-    return null;
-  }
-
-  try {
-    const index: SessionsIndex = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
-    const entry = index.entries.find(e => e.sessionId === sessionId);
-    if (entry?.summary) {
-      return entry.summary;
-    }
-  } catch (err) {
-    log(`Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  return null;
-}
-
-/**
- * Archive the full transcript to conversations/ before compaction.
- */
-function createPreCompactHook(assistantName?: string): HookCallback {
-  return async (input, _toolUseId, _context) => {
-    const preCompact = input as PreCompactHookInput;
-    const transcriptPath = preCompact.transcript_path;
-    const sessionId = preCompact.session_id;
-
-    if (!transcriptPath || !fs.existsSync(transcriptPath)) {
-      log('No transcript found for archiving');
-      return {};
-    }
-
-    try {
-      const content = fs.readFileSync(transcriptPath, 'utf-8');
-      const messages = parseTranscript(content);
-
-      if (messages.length === 0) {
-        log('No messages to archive');
-        return {};
-      }
-
-      const summary = getSessionSummary(sessionId, transcriptPath);
-      const name = summary ? sanitizeFilename(summary) : generateFallbackName();
-
-      const conversationsDir = '/workspace/group/conversations';
-      fs.mkdirSync(conversationsDir, { recursive: true });
-
-      const date = new Date().toISOString().split('T')[0];
-      const filename = `${date}-${name}.md`;
-      const filePath = path.join(conversationsDir, filename);
-
-      const markdown = formatTranscriptMarkdown(messages, summary, assistantName);
-      fs.writeFileSync(filePath, markdown);
-
-      log(`Archived conversation to ${filePath}`);
-    } catch (err) {
-      log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
-    return {};
-  };
-}
-
-function sanitizeFilename(summary: string): string {
-  return summary
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 50);
-}
-
-function generateFallbackName(): string {
-  const time = new Date();
-  return `conversation-${time.getHours().toString().padStart(2, '0')}${time.getMinutes().toString().padStart(2, '0')}`;
-}
-
-interface ParsedMessage {
-  role: 'user' | 'assistant';
-  content: string;
-}
-
-function parseTranscript(content: string): ParsedMessage[] {
-  const messages: ParsedMessage[] = [];
-
-  for (const line of content.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === 'user' && entry.message?.content) {
-        const text = typeof entry.message.content === 'string'
-          ? entry.message.content
-          : entry.message.content.map((c: { text?: string }) => c.text || '').join('');
-        if (text) messages.push({ role: 'user', content: text });
-      } else if (entry.type === 'assistant' && entry.message?.content) {
-        const textParts = entry.message.content
-          .filter((c: { type: string }) => c.type === 'text')
-          .map((c: { text: string }) => c.text);
-        const text = textParts.join('');
-        if (text) messages.push({ role: 'assistant', content: text });
-      }
-    } catch {
-    }
-  }
-
-  return messages;
-}
-
-function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | null, assistantName?: string): string {
-  const now = new Date();
-  const formatDateTime = (d: Date) => d.toLocaleString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true
+async function readStdin(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', chunk => { data += chunk; });
+    process.stdin.on('end', () => resolve(data));
+    process.stdin.on('error', reject);
   });
-
-  const lines: string[] = [];
-  lines.push(`# ${title || 'Conversation'}`);
-  lines.push('');
-  lines.push(`Archived: ${formatDateTime(now)}`);
-  lines.push('');
-  lines.push('---');
-  lines.push('');
-
-  for (const msg of messages) {
-    const sender = msg.role === 'user' ? 'User' : (assistantName || 'Assistant');
-    const content = msg.content.length > 2000
-      ? msg.content.slice(0, 2000) + '...'
-      : msg.content;
-    lines.push(`**${sender}**: ${content}`);
-    lines.push('');
-  }
-
-  return lines.join('\n');
 }
 
 /**
@@ -269,10 +76,6 @@ function shouldClose(): boolean {
   return false;
 }
 
-/**
- * Drain all pending IPC input messages.
- * Returns messages found, or empty array.
- */
 function drainIpcInput(): string[] {
   try {
     fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
@@ -301,10 +104,6 @@ function drainIpcInput(): string[] {
   }
 }
 
-/**
- * Wait for a new IPC message or _close sentinel.
- * Returns the messages as a single string, or null if _close.
- */
 function waitForIpcMessage(): Promise<string | null> {
   return new Promise((resolve) => {
     const poll = () => {
@@ -324,144 +123,107 @@ function waitForIpcMessage(): Promise<string | null> {
 }
 
 /**
- * Run a single query and stream results via writeOutput.
- * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
- * allowing agent teams subagents to run to completion.
- * Also pipes IPC messages into the stream during the query.
+ * Build a system prompt from the group context files (CLAUDE.md equivalent).
+ */
+function buildSystemPrompt(containerInput: ContainerInput): string {
+  const parts: string[] = [];
+
+  // Assistant identity
+  if (containerInput.assistantName) {
+    parts.push(`You are ${containerInput.assistantName}, a helpful AI assistant.`);
+  } else {
+    parts.push('You are a helpful AI assistant.');
+  }
+
+  // Global CLAUDE.md (non-main groups only)
+  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
+  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
+    try {
+      const content = fs.readFileSync(globalClaudeMdPath, 'utf-8').trim();
+      if (content) parts.push(content);
+    } catch { /* skip */ }
+  }
+
+  // Group CLAUDE.md
+  const groupClaudeMdPath = '/workspace/group/CLAUDE.md';
+  if (fs.existsSync(groupClaudeMdPath)) {
+    try {
+      const content = fs.readFileSync(groupClaudeMdPath, 'utf-8').trim();
+      if (content) parts.push(content);
+    } catch { /* skip */ }
+  }
+
+  // Scheduled task context
+  if (containerInput.isScheduledTask) {
+    parts.push('Note: This message was sent automatically as a scheduled task, not directly by a user.');
+  }
+
+  return parts.join('\n\n');
+}
+
+/**
+ * Run a single Gemini generateContent call with the accumulated chat history.
+ * Polls for IPC _close sentinel concurrently while awaiting the API response.
  */
 async function runQuery(
-  prompt: string,
-  sessionId: string | undefined,
-  mcpServerPath: string,
-  containerInput: ContainerInput,
-  sdkEnv: Record<string, string | undefined>,
-  resumeAt?: string,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
-  const stream = new MessageStream();
-  stream.push(prompt);
+  userText: string,
+  history: any[],
+  provider: GeminiProvider,
+): Promise<{ replyText: string; closedDuringQuery: boolean }> {
+  // Check close before starting
+  if (shouldClose()) {
+    return { replyText: '', closedDuringQuery: true };
+  }
 
-  // Poll IPC for follow-up messages and _close sentinel during the query
-  let ipcPolling = true;
+  // Build the full contents array: history + new user message
+  const contents = [
+    ...history,
+    { role: 'user', parts: [{ text: userText }] },
+  ];
+
+  log(`Calling Provider API (history turns: ${history.length}, prompt length: ${userText.length})`);
+
+  // Race: Provider API call vs _close sentinel poll
   let closedDuringQuery = false;
-  const pollIpcDuringQuery = () => {
-    if (!ipcPolling) return;
-    if (shouldClose()) {
-      log('Close sentinel detected during query, ending stream');
-      closedDuringQuery = true;
-      stream.end();
-      ipcPolling = false;
-      return;
-    }
-    const messages = drainIpcInput();
-    for (const text of messages) {
-      log(`Piping IPC message into active query (${text.length} chars)`);
-      stream.push(text);
-    }
-    setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
-  };
-  setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
+  let closeCheckInterval: ReturnType<typeof setInterval> | null = null;
 
-  let newSessionId: string | undefined;
-  let lastAssistantUuid: string | undefined;
-  let messageCount = 0;
-  let resultCount = 0;
+  const apiPromise = provider.chat(contents);
 
-  // Load global CLAUDE.md as additional system context (shared across all groups)
-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
-  let globalClaudeMd: string | undefined;
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
-    globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
-  }
-
-  // Discover additional directories mounted at /workspace/extra/*
-  // These are passed to the SDK so their CLAUDE.md files are loaded automatically
-  const extraDirs: string[] = [];
-  const extraBase = '/workspace/extra';
-  if (fs.existsSync(extraBase)) {
-    for (const entry of fs.readdirSync(extraBase)) {
-      const fullPath = path.join(extraBase, entry);
-      if (fs.statSync(fullPath).isDirectory()) {
-        extraDirs.push(fullPath);
+  const closePromise = new Promise<void>((resolve) => {
+    closeCheckInterval = setInterval(() => {
+      if (shouldClose()) {
+        closedDuringQuery = true;
+        resolve();
       }
-    }
-  }
-  if (extraDirs.length > 0) {
-    log(`Additional directories: ${extraDirs.join(', ')}`);
-  }
+    }, IPC_POLL_MS);
+  });
 
-  for await (const message of query({
-    prompt: stream,
-    options: {
-      cwd: '/workspace/group',
-      additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
-      resume: sessionId,
-      resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
-        : undefined,
-      allowedTools: [
-        'Bash',
-        'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
-        'TodoWrite', 'ToolSearch', 'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*'
-      ],
-      env: sdkEnv,
-      permissionMode: 'bypassPermissions',
-      allowDangerouslySkipPermissions: true,
-      settingSources: ['project', 'user'],
-      mcpServers: {
-        nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
-          },
-        },
-      },
-      hooks: {
-        PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
-      },
-    }
-  })) {
-    messageCount++;
-    const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
-    log(`[msg #${messageCount}] type=${msgType}`);
+  // Wait for API (close detection is best-effort; we finish the request regardless)
+  const apiResult = await Promise.race([
+    apiPromise.then(r => r),
+    closePromise.then(() => null),
+  ]);
 
-    if (message.type === 'assistant' && 'uuid' in message) {
-      lastAssistantUuid = (message as { uuid: string }).uuid;
-    }
+  if (closeCheckInterval) clearInterval(closeCheckInterval);
 
-    if (message.type === 'system' && message.subtype === 'init') {
-      newSessionId = message.session_id;
-      log(`Session initialized: ${newSessionId}`);
-    }
-
-    if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-      const tn = message as { task_id: string; status: string; summary: string };
-      log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
-    }
-
-    if (message.type === 'result') {
-      resultCount++;
-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
-      writeOutput({
-        status: 'success',
-        result: textResult || null,
-        newSessionId
-      });
+  // If closed before API returned, still try to get the result if it resolved
+  let replyText = '';
+  if (apiResult !== null) {
+    const result = apiResult as Awaited<typeof apiPromise>;
+    replyText = result.content;
+    log(`Provider response received (${replyText.length} chars)`);
+  } else {
+    // Try to get result from already-pending promise
+    try {
+      const result = await apiPromise;
+      replyText = result.content;
+      log(`Provider response received after close signal (${replyText.length} chars)`);
+    } catch {
+      log('Close detected before Provider response; skipping');
     }
   }
 
-  ipcPolling = false;
-  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
+  return { replyText, closedDuringQuery };
 }
 
 async function main(): Promise<void> {
@@ -481,14 +243,25 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
-  // No real secrets exist in the container environment.
-  const sdkEnv: Record<string, string | undefined> = { ...process.env };
+  // Read Gemini credentials from secrets (forwarded by container-runner.ts)
+  const apiKey = containerInput.secrets?.GOOGLE_API_KEY || process.env.GOOGLE_API_KEY;
+  const modelName = containerInput.secrets?.NANO_MODEL || process.env.NANO_MODEL || 'gemini-2.0-flash';
 
-  const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
+  if (!apiKey) {
+    writeOutput({
+      status: 'error',
+      result: null,
+      error: 'GOOGLE_API_KEY is not set. Add it to your .env file.'
+    });
+    process.exit(1);
+  }
 
-  let sessionId = containerInput.sessionId;
+  const systemPrompt = buildSystemPrompt(containerInput);
+  log(`Using model: ${modelName}`);
+  log(`System prompt length: ${systemPrompt.length} chars`);
+
+  const provider = new GeminiProvider(apiKey, modelName);
+  
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
   // Clean up stale _close sentinel from previous container runs
@@ -499,40 +272,56 @@ async function main(): Promise<void> {
   if (containerInput.isScheduledTask) {
     prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
   }
+  
+  if (systemPrompt) {
+    prompt = `System Instructions:\n${systemPrompt}\n\nUser Request:\n${prompt}`;
+  }
+  
   const pending = drainIpcInput();
   if (pending.length > 0) {
     log(`Draining ${pending.length} pending IPC messages into initial prompt`);
     prompt += '\n' + pending.join('\n');
   }
 
-  // Query loop: run query → wait for IPC message → run new query → repeat
-  let resumeAt: string | undefined;
+  // In-memory multi-turn history (persists across IPC turns within this container lifetime)
+  const history: any[] = [];
+
+  // Query loop: send prompt → append turn to history → wait for IPC → repeat
   try {
     while (true) {
-      log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
+      log(`Starting Provider query (history turns: ${history.length})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
-      if (queryResult.newSessionId) {
-        sessionId = queryResult.newSessionId;
+      const { replyText, closedDuringQuery } = await runQuery(prompt, history, provider);
+
+      // Append this turn to history for context continuity
+      if (prompt) {
+        history.push({ role: 'user', parts: [{ text: prompt }] });
       }
-      if (queryResult.lastAssistantUuid) {
-        resumeAt = queryResult.lastAssistantUuid;
+      if (replyText) {
+        history.push({ role: 'model', parts: [{ text: replyText }] });
       }
 
-      // If _close was consumed during the query, exit immediately.
-      // Don't emit a session-update marker (it would reset the host's
-      // idle timer and cause a 30-min delay before the next _close).
-      if (queryResult.closedDuringQuery) {
+      // Truncate history to stay within token limits
+      while (history.length > MAX_HISTORY_TURNS) {
+        history.shift();
+      }
+
+      // Emit result (no sessionId — Provider is stateless; we use in-memory history)
+      writeOutput({
+        status: 'success',
+        result: replyText || null,
+      });
+
+      if (closedDuringQuery) {
         log('Close sentinel consumed during query, exiting');
         break;
       }
 
-      // Emit session update so host can track it
-      writeOutput({ status: 'success', result: null, newSessionId: sessionId });
+      // Emit session-update marker so host can track idle state
+      writeOutput({ status: 'success', result: null });
 
       log('Query ended, waiting for next IPC message...');
 
-      // Wait for the next message or _close sentinel
       const nextMessage = await waitForIpcMessage();
       if (nextMessage === null) {
         log('Close sentinel received, exiting');
@@ -548,7 +337,6 @@ async function main(): Promise<void> {
     writeOutput({
       status: 'error',
       result: null,
-      newSessionId: sessionId,
       error: errorMessage
     });
     process.exit(1);
