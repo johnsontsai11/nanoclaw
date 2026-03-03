@@ -9,12 +9,20 @@ ENV NODE_OPTIONS=--dns-result-order=ipv4first
 # Create app directory
 WORKDIR /app
 
-# Copy the entire agent-runner (including pre-built node_modules and dist)
-# This avoids needing internet access during the build process
-COPY agent-runner/ ./
+# Copy the source files
+COPY agent-runner/package*.json ./
+COPY agent-runner/src/ ./src/
+COPY agent-runner/tsconfig.json ./
+
+# Install dependencies during build
+RUN npm install
 
 # Install system utilities needed by agent bash scripts
-RUN apt-get update && apt-get install -y --no-install-recommends jq && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends jq curl ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Add MCP/Agent-Browser shims
+RUN printf '#!/bin/bash\nMESSAGE="$1"\nif [ "$1" == "--message" ]; then MESSAGE="$2"; fi\nif [ -z "$MESSAGE" ]; then MESSAGE=$(cat); fi\nFILENAME="/workspace/ipc/messages/msg_$(date +%%s)_$RANDOM.json"\necho "{\\"type\\": \\"message\\", \\"chatJid\\": \\"$CHAT_JID\\", \\"text\\": \\"$MESSAGE\\"}" > "$FILENAME"\n' > /usr/local/bin/mcp__nanoclaw__send_message && chmod +x /usr/local/bin/mcp__nanoclaw__send_message
+RUN printf '#!/bin/bash\nCOMMAND="$1"\nURL="$2"\nif [ "$COMMAND" == "open" ]; then curl -v -L "$URL"; elif [ "$COMMAND" == "search" ]; then curl -v -L "https://www.google.com/search?q=$(echo $2 | jq -sRr @uri)"; else curl -v -L "$@"; fi\n' > /usr/local/bin/agent-browser && chmod +x /usr/local/bin/agent-browser
 
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input

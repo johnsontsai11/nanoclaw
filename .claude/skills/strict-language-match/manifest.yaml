@@ -1,0 +1,12 @@
+skill: strict-language-match
+version: 1.0.0
+description: Enforce language matching between user input and assistant response using host-side detection.
+author: Dart
+license: MIT
+core_version: ">=1.1.0"
+adds: []
+modifies:
+  - src/index.ts
+  - container/agent-runner/src/index.ts
+conflicts: []
+depends: []

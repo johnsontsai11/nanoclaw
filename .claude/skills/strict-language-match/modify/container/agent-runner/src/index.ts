@@ -17,7 +17,7 @@
 import fs from 'fs';
 import path from 'path';
 import { exec } from 'child_process';
-import { GeminiProvider } from './providers/gemini.provider.js';
+import { GoogleGenerativeAI, Content } from '@google/generative-ai';
 
 interface ContainerInput {
   prompt: string;
@@ -66,9 +66,6 @@ async function readStdin(): Promise<string> {
   });
 }
 
-/**
- * Check for _close sentinel.
- */
 function shouldClose(): boolean {
   if (fs.existsSync(IPC_INPUT_CLOSE_SENTINEL)) {
     try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
@@ -123,13 +120,10 @@ function waitForIpcMessage(): Promise<string | null> {
   });
 }
 
-function executeBash(command: string, chatJid: string): Promise<{ output: string; exitCode: number }> {
+function executeBash(command: string): Promise<{ output: string; exitCode: number }> {
   return new Promise((resolve) => {
     log(`Executing bash: ${command}`);
-    // PASS CHAT_JID to the environment so skills (like news-briefing) can use it
-    exec(command, {
-      env: { ...process.env, CHAT_JID: chatJid }
-    }, (error, stdout, stderr) => {
+    exec(command, (error, stdout, stderr) => {
       const output = stdout + stderr;
       const exitCode = error ? (error.code || 1) : 0;
       resolve({ output, exitCode });
@@ -150,10 +144,16 @@ function buildSystemPrompt(containerInput: ContainerInput): string {
     parts.push('You are a helpful AI assistant.');
   }
 
-  // Language rules and other guidelines are now managed via skills and global CLAUDE.md
-  // No longer hardcoded in the runner source.
+  // Hardcoded language rule — placed early so it cannot be overridden by CLAUDE.md content
+  // or topic inference (e.g., replying in Chinese just because content is about Taiwan).
+  parts.push(
+    'SYSTEM RULE — LANGUAGE: Always reply in the same language the user writes in. ' +
+    'If the user writes in English, reply in English — even if the topic is about Chinese news, Taiwan, etc. ' +
+    'If the user writes in Chinese, reply in Chinese. ' +
+    'Never switch languages based on the subject matter, only based on what language the user used.',
+  );
 
-  // Hardcoded tool format rules
+  // Hardcoded tool format rules — must come before any CLAUDE.md content
   parts.push(
     'IMPORTANT: The ONLY way to run code or execute commands is by wrapping bash commands in <execute_bash> tags, like this:\n' +
     '<execute_bash>echo "hello"</execute_bash>\n\n' +
@@ -161,10 +161,12 @@ function buildSystemPrompt(containerInput: ContainerInput): string {
     'These are not supported and will not work. Only <execute_bash> is supported.',
   );
 
-  // Global CLAUDE.md (all groups, including main)
+  // Global CLAUDE.md (all groups, including main).
+  // Main group also has a fallback via the project mount in case /workspace/global
+  // isn't available yet.
   const globalClaudeMdPaths = [
     '/workspace/global/CLAUDE.md',
-    '/workspace/project/groups/global/CLAUDE.md',
+    '/workspace/project/groups/global/CLAUDE.md', // fallback for main group
   ];
   for (const globalPath of globalClaudeMdPaths) {
     if (fs.existsSync(globalPath)) {
@@ -172,7 +174,7 @@ function buildSystemPrompt(containerInput: ContainerInput): string {
         const content = fs.readFileSync(globalPath, 'utf-8').trim();
         if (content) {
           parts.push(content);
-          break;
+          break; // Only load once
         }
       } catch { /* skip */ }
     }
@@ -192,7 +194,7 @@ function buildSystemPrompt(containerInput: ContainerInput): string {
     parts.push('Note: This message was sent automatically as a scheduled task, not directly by a user.');
   }
 
-  // Runtime context
+  // Inject runtime context: group identity (needed for IPC task scheduling)
   const contextLines: string[] = ['## Runtime Context (injected by host)'];
   if (containerInput.chatJid) {
     contextLines.push(`- **Current group JID**: \`${containerInput.chatJid}\` — use this as \`targetJid\` when scheduling tasks for this group`);
@@ -211,24 +213,27 @@ function buildSystemPrompt(containerInput: ContainerInput): string {
  */
 async function runQuery(
   userText: string,
-  history: any[],
-  provider: GeminiProvider,
+  history: Content[],
+  model: ReturnType<InstanceType<typeof GoogleGenerativeAI>['getGenerativeModel']>,
 ): Promise<{ replyText: string; closedDuringQuery: boolean }> {
+  // Check close before starting
   if (shouldClose()) {
     return { replyText: '', closedDuringQuery: true };
   }
 
-  const contents = [
+  // Build the full contents array: history + new user message
+  const contents: Content[] = [
     ...history,
     { role: 'user', parts: [{ text: userText }] },
   ];
 
-  log(`Calling Provider API (history turns: ${history.length}, prompt length: ${userText.length})`);
+  log(`Calling Gemini API (history turns: ${history.length}, prompt length: ${userText.length})`);
 
+  // Race: Gemini API call vs _close sentinel poll
   let closedDuringQuery = false;
   let closeCheckInterval: ReturnType<typeof setInterval> | null = null;
 
-  const apiPromise = provider.chat(contents);
+  const apiPromise = model.generateContent({ contents });
 
   const closePromise = new Promise<void>((resolve) => {
     closeCheckInterval = setInterval(() => {
@@ -239,6 +244,7 @@ async function runQuery(
     }, IPC_POLL_MS);
   });
 
+  // Wait for API (close detection is best-effort; we finish the request regardless)
   const apiResult = await Promise.race([
     apiPromise.then(r => r),
     closePromise.then(() => null),
@@ -246,18 +252,21 @@ async function runQuery(
 
   if (closeCheckInterval) clearInterval(closeCheckInterval);
 
+  // If closed before API returned, still try to get the result if it resolved
   let replyText = '';
   if (apiResult !== null) {
+    // apiResult is the GenerateContentResult
     const result = apiResult as Awaited<typeof apiPromise>;
-    replyText = result.content;
-    log(`Provider response received (${replyText.length} chars)`);
+    replyText = result.response.text();
+    log(`Gemini response received (${replyText.length} chars)`);
   } else {
+    // Try to get result from already-pending promise (it may have finished)
     try {
       const result = await apiPromise;
-      replyText = result.content;
-      log(`Provider response received after close signal (${replyText.length} chars)`);
+      replyText = result.response.text();
+      log(`Gemini response received after close signal (${replyText.length} chars)`);
     } catch {
-      log('Close detected before Provider response; skipping');
+      log('Close detected before Gemini response; skipping');
     }
   }
 
@@ -270,6 +279,7 @@ async function main(): Promise<void> {
   try {
     const stdinData = await readStdin();
     containerInput = JSON.parse(stdinData);
+    // Delete the temp file the entrypoint wrote — it contains secrets
     try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
     log(`Received input for group: ${containerInput.groupFolder}`);
   } catch (err) {
@@ -281,8 +291,10 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  try {
+  // Read Gemini credentials from secrets (forwarded by container-runner.ts)
   const apiKey = containerInput.secrets?.GOOGLE_API_KEY || process.env.GOOGLE_API_KEY;
-  const modelName = containerInput.secrets?.NANO_MODEL || process.env.NANO_MODEL || 'gemini-2.0-flash';
+  const modelName = containerInput.secrets?.NANO_MODEL || process.env.NANO_MODEL || 'gemini-2.0-flash-lite';
 
   if (!apiKey) {
     writeOutput({
@@ -297,107 +309,115 @@ async function main(): Promise<void> {
   log(`Using model: ${modelName}`);
   log(`System prompt length: ${systemPrompt.length} chars`);
 
-  const provider = new GeminiProvider(apiKey, modelName);
-  
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({
+    model: modelName,
+    systemInstruction: systemPrompt,
+  });
+
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
+
+  // Clean up stale _close sentinel from previous container runs
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
 
+  // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
   if (containerInput.isScheduledTask) {
     prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
   }
-  
-  if (systemPrompt) {
-    prompt = `System Instructions:\n${systemPrompt}\n\nUser Request:\n${prompt}`;
-  }
-  
   const pending = drainIpcInput();
   if (pending.length > 0) {
     log(`Draining ${pending.length} pending IPC messages into initial prompt`);
     prompt += '\n' + pending.join('\n');
   }
 
-  const history: any[] = [];
+  // In-memory multi-turn history (persists across IPC turns within this container lifetime)
+  const history: Content[] = [];
 
-  try {
-    let currentPrompt = prompt;
-    while (true) {
-      log(`Starting Provider query (history turns: ${history.length})...`);
+      // Query loop: send prompt → append turn to history → wait for IPC → repeat
+      let currentPrompt = prompt;
+      while (true) {
+        log(`Starting Gemini query (history turns: ${history.length})...`);
 
-      const { replyText, closedDuringQuery } = await runQuery(currentPrompt, history, provider);
+        const { replyText, closedDuringQuery } = await runQuery(currentPrompt, history, model);
 
-      // Append user turn to history
-      if (currentPrompt) {
-        history.push({ role: 'user', parts: [{ text: currentPrompt }] });
-      }
-      
-      let finalReply = replyText;
-      let iteration = 0;
-      const MAX_ITERATIONS = 5;
-
-      // Tool execution loop
-      while (iteration < MAX_ITERATIONS) {
-        const bashMatch = finalReply.match(/<execute_bash>([\s\S]*?)<\/execute_bash>/);
-        if (!bashMatch) break;
-
-        iteration++;
-        const command = bashMatch[1].trim();
+        // Append user turn to history
+        if (currentPrompt) {
+          history.push({ role: 'user', parts: [{ text: currentPrompt }] });
+        }
         
-        // Append model turn (with tool call) to history
-        history.push({ role: 'model', parts: [{ text: finalReply }] });
+        let finalReply = replyText;
+        let iteration = 0;
+        const MAX_ITERATIONS = 5;
 
-        const { output, exitCode } = await executeBash(command, containerInput.chatJid);
-        
-        // Wrap observation in a structured tag so Gemini interprets it as a tool result,
-        // not as user content to echo back to the user.
-        const observation = `<bash_result exit_code="${exitCode}">${output}</bash_result>`;
-        
-        log(`Bash output (${output.length} chars), re-calling Provider...`);
-        
-        const { replyText: nextReply, closedDuringQuery: closedInTool } = await runQuery(observation, history, provider);
-        
-        // Append observation turn to history
-        history.push({ role: 'user', parts: [{ text: observation }] });
-        
-        finalReply = nextReply;
-        if (closedInTool) break;
+        // Tool execution loop
+        while (iteration < MAX_ITERATIONS) {
+          const bashMatch = finalReply.match(/<execute_bash>([\s\S]*?)<\/execute_bash>/);
+          if (!bashMatch) break;
+
+          iteration++;
+          const command = bashMatch[1].trim();
+          
+          // Append model turn (with tool call) to history
+          history.push({ role: 'model', parts: [{ text: finalReply }] });
+
+          const { output, exitCode } = await executeBash(command);
+          // Wrap observation in a structured tag so Gemini interprets it as a tool result,
+          // not as user content to echo back to the user.
+          const observation = `<bash_result exit_code="${exitCode}">${output}</bash_result>`;
+          
+          log(`Bash output (${output.length} chars), re-calling Gemini...`);
+          
+          // Gemini doesn't have "observation" role, so we use "user" for tool results
+          const { replyText: nextReply, closedDuringQuery: closedInTool } = await runQuery(observation, history, model);
+          
+          // Append observation turn to history
+          history.push({ role: 'user', parts: [{ text: observation }] });
+          
+          finalReply = nextReply;
+          if (closedInTool) break;
+        }
+
+        // Final model turn to history
+        if (finalReply && iteration === 0) {
+           // If no tools were used, finalReply is already the result of the first runQuery
+           // and we already handled its user prompt above.
+           history.push({ role: 'model', parts: [{ text: finalReply }] });
+        } else if (finalReply) {
+           // If tools were used, the last model response is the final one
+           history.push({ role: 'model', parts: [{ text: finalReply }] });
+        }
+
+        // Truncate history to stay within token limits
+        while (history.length > MAX_HISTORY_TURNS) {
+          history.shift();
+        }
+
+        // Emit result
+        writeOutput({
+          status: 'success',
+          result: finalReply || null,
+        });
+
+        if (closedDuringQuery) {
+          log('Close sentinel consumed during query, exiting');
+          break;
+        }
+
+        // Emit session-update marker so host can track idle state
+        writeOutput({ status: 'success', result: null });
+
+        log('Query ended, waiting for next IPC message...');
+
+        const nextMessage = await waitForIpcMessage();
+        if (nextMessage === null) {
+          log('Close sentinel received, exiting');
+          break;
+        }
+
+        log(`Got new message (${nextMessage.length} chars), starting new query`);
+        currentPrompt = nextMessage;
       }
-
-      // Final model turn to history
-      if (finalReply) {
-        history.push({ role: 'model', parts: [{ text: finalReply }] });
-      }
-
-      // Truncate history to stay within token limits
-      while (history.length > MAX_HISTORY_TURNS) {
-        history.shift();
-      }
-
-      // Emit result
-      writeOutput({
-        status: 'success',
-        result: finalReply || null,
-      });
-
-      if (closedDuringQuery) {
-        log('Close sentinel consumed during query, exiting');
-        break;
-      }
-
-      // Emit session-update marker so host can track idle state
-      writeOutput({ status: 'success', result: null });
-
-      log('Query ended, waiting for next IPC message...');
-
-      const nextMessage = await waitForIpcMessage();
-      if (nextMessage === null) {
-        log('Close sentinel received, exiting');
-        break;
-      }
-
-      log(`Got new message (${nextMessage.length} chars), starting new query`);
-      currentPrompt = nextMessage;
-    }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);

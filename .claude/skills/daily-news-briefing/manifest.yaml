@@ -1,0 +1,14 @@
+skill: daily-news-briefing
+version: 1.0.0
+description: Set up a daily international and local news briefing with financial market updates.
+author: Dart
+license: MIT
+core_version: ">=1.1.0"
+adds:
+  - scripts/setup-briefing.ts
+  - DAILY_BRIEFING.md
+modifies: []
+conflicts: []
+depends: []
+post_apply:
+  - npx tsx scripts/setup-briefing.ts
