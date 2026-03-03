@@ -6,6 +6,7 @@ import {
   CREDENTIAL_PROXY_PORT,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
+  RETRY_LIMIT,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
@@ -64,6 +65,11 @@ let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+
+// Tracks when the last "Got it..." ack was sent per chat, to prevent duplicates.
+const lastAckSentAt = new Map<string, number>();
+const ACK_COOLDOWN_MS = 60_000; // 1 minute
+const busyChats = new Set<string>(); // Tracks which chats are currently "thinking"
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -163,12 +169,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Backlog safety: If we have an overwhelming number of missed messages,
   // skip the old ones and only process the most recent context to avoid
   // exploding the Token count (TPM) and hitting 429 errors.
-  if (missedMessages.length > 50) {
+  const BACKLOG_THRESHOLD = 10;
+  if (missedMessages.length > BACKLOG_THRESHOLD) {
     logger.warn(
       { jid: chatJid, totalMissed: missedMessages.length },
-      'Backlog too large, truncating to most recent 10 messages'
+      `Backlog too large, truncating to most recent ${BACKLOG_THRESHOLD} messages`
     );
-    missedMessages = missedMessages.slice(-10);
+    missedMessages = missedMessages.slice(-BACKLOG_THRESHOLD);
   }
 
   // For non-main groups, check if trigger is required and present
@@ -211,57 +218,114 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   };
 
   await channel.setTyping?.(chatJid, true);
+  busyChats.add(chatJid);
+  // Reset the cooldown timer whenever processing starts fresh, so stale
+  // timestamps from previous long-running tasks don't cause "Still working on it..."
+  // to fire immediately for a quick follow-up query.
+  lastAckSentAt.set(chatJid, Date.now());
+
+  // Periodically send "Still working on it..." during long-running tasks.
+  // Checks every 10s if we are busy and if a minute has passed since the last interaction.
+  const progressInterval = setInterval(() => {
+    if (!busyChats.has(chatJid)) return;
+    
+    const now = Date.now();
+    const last = lastAckSentAt.get(chatJid) ?? 0;
+    if (now - last >= ACK_COOLDOWN_MS) {
+      lastAckSentAt.set(chatJid, now);
+      logger.info({ chatJid }, 'Sending periodic progress update');
+      channel.sendMessage(chatJid, 'Still working on it...').catch(() => {});
+    }
+  }, 10_000);
+
   let hadError = false;
   let outputSentToUser = false;
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+  try {
+    const output = await runAgent(group, prompt, chatJid, async (result) => {
+      // Streaming output callback — called for each agent result
+      if (result.result) {
+        busyChats.add(chatJid);
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        // Strip internal/tool tags using shared formatOutbound
+        const text = formatOutbound(raw);
+        logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
+        if (text) {
+          // Fire and forget send message so it doesn't block container cleanup
+          channel.sendMessage(chatJid, text).catch((err) =>
+            logger.warn({ chatJid, err }, 'Failed to send agent streaming output'),
+          );
+          outputSentToUser = true;
+        }
+        // Only reset idle timer on actual results, not session-update markers (result: null)
+        resetIdleTimer();
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
+      if (result.status === 'success') {
+        if (result.result === null) {
+          // Turn completed, waiting for IPC
+          busyChats.delete(chatJid);
+        }
+        queue.notifyIdle(chatJid);
+      }
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
+      if (result.status === 'error') {
+        hadError = true;
+        busyChats.delete(chatJid);
+        
+        if (result.error && result.error.includes('429 Too Many Requests') && result.error.includes('Quota exceeded')) {
+          const currentRetries = queue.getRetryCount(chatJid);
+          if (currentRetries >= RETRY_LIMIT) {
+            channel.sendMessage(
+              chatJid,
+              `❌ *API Quota Limit* still exceeded after multiple retries. I've stopped trying for now. Please ask again later.`
+            ).catch(() => {});
+          } else {
+            const nextDelaySecs = Math.round((5000 * Math.pow(2, currentRetries)) / 1000);
+            channel.sendMessage(
+              chatJid,
+              `⚠️ *API Quota Limit Reached*\nGoogle says I'm thinking too fast right now. I will automatically try again quietly in ${nextDelaySecs} seconds.`
+            ).catch(() => {});
+          }
+        } else if (result.error && (result.error.includes('API key expired') || result.error.includes('api key not found') || result.error.includes('API_KEY_INVALID'))) {
+          channel.sendMessage(
+            chatJid,
+            `❌ *Invalid API Key!*\n\nGoogle is reporting that your API key is expired or invalid. Please update your \`GOOGLE_API_KEY\` in the \`.env\` file and run \`./restart.sh\`.`
+          ).catch(() => {});
+        }
+      }
+    });
 
-  await channel.setTyping?.(chatJid, false);
-  if (idleTimer) clearTimeout(idleTimer);
-
-  if (output === 'error' || hadError) {
-    // If we already sent output to the user, don't roll back the cursor —
-    // the user got their response and re-processing would send duplicates.
-    if (outputSentToUser) {
+    if (output === 'error' || hadError) {
+      // If we already sent output to the user, don't roll back the cursor —
+      // the user got their response and re-processing would send duplicates.
+      if (outputSentToUser) {
+        logger.warn(
+          { group: group.name },
+          'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
+        );
+        return true;
+      }
+      // Roll back cursor so retries can re-process these messages
+      lastAgentTimestamp[chatJid] = previousCursor;
+      saveState();
       logger.warn(
         { group: group.name },
-        'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
+        'Agent error, rolled back message cursor for retry',
       );
-      return true;
+      return false;
     }
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
-    saveState();
-    logger.warn(
-      { group: group.name },
-      'Agent error, rolled back message cursor for retry',
-    );
+  } catch (err) {
+    logger.error({ group: group.name, err }, 'Critical error in processGroupMessages');
     return false;
+  } finally {
+    await channel.setTyping?.(chatJid, false);
+    busyChats.delete(chatJid);
+    clearInterval(progressInterval);
+    if (idleTimer) clearTimeout(idleTimer);
   }
 
   return true;
@@ -422,7 +486,28 @@ async function startMessageLoop(): Promise<void> {
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
+          // Send an immediate acknowledgment that the message was received.
+          const now = Date.now();
+          const lastAck = lastAckSentAt.get(chatJid) ?? 0;
+          const isBusy = queue.isActive(chatJid);
+
+          if (isBusy && (now - lastAck > ACK_COOLDOWN_MS)) {
+            // Delay the ack by 5s — if the response arrives faster (common for simple
+            // queries) the timeout will be cancelled before it ever fires.
+            lastAckSentAt.set(chatJid, now);
+            setTimeout(() => {
+              // Only send if still busy by the time the delay fires
+              if (queue.isActive(chatJid)) {
+                channel.sendMessage(
+                  chatJid,
+                  'Got the new input! Still working on the current task...'
+                ).catch(() => {});
+              }
+            }, 5000);
+          }
+
           if (queue.sendMessage(chatJid, formatted)) {
+            busyChats.add(chatJid);
             logger.debug(
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
@@ -582,6 +667,23 @@ async function main(): Promise<void> {
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
+    refreshTasksSnapshot: (groupFolder, isMain) => {
+      // Immediately refresh snapshot so containers see up-to-date task list
+      const tasks = getAllTasks();
+      writeTasksSnapshot(
+        groupFolder,
+        isMain,
+        tasks.map((t) => ({
+          id: t.id,
+          groupFolder: t.group_folder,
+          prompt: t.prompt,
+          schedule_type: t.schedule_type,
+          schedule_value: t.schedule_value,
+          status: t.status,
+          next_run: t.next_run,
+        })),
+      );
+    },
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();

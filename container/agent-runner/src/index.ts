@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { exec } from 'child_process';
 import { GeminiProvider } from './providers/gemini.provider.js';
 
 interface ContainerInput {
@@ -122,6 +123,17 @@ function waitForIpcMessage(): Promise<string | null> {
   });
 }
 
+function executeBash(command: string): Promise<{ output: string; exitCode: number }> {
+  return new Promise((resolve) => {
+    log(`Executing bash: ${command}`);
+    exec(command, (error, stdout, stderr) => {
+      const output = stdout + stderr;
+      const exitCode = error ? (error.code || 1) : 0;
+      resolve({ output, exitCode });
+    });
+  });
+}
+
 /**
  * Build a system prompt from the group context files (CLAUDE.md equivalent).
  */
@@ -135,13 +147,37 @@ function buildSystemPrompt(containerInput: ContainerInput): string {
     parts.push('You are a helpful AI assistant.');
   }
 
-  // Global CLAUDE.md (non-main groups only)
-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
-    try {
-      const content = fs.readFileSync(globalClaudeMdPath, 'utf-8').trim();
-      if (content) parts.push(content);
-    } catch { /* skip */ }
+  // Hardcoded language rule
+  parts.push(
+    'SYSTEM RULE — LANGUAGE: Always reply in the same language the user writes in. ' +
+    'If the user writes in English, reply in English — even if the topic is about Chinese news, Taiwan, etc. ' +
+    'If the user writes in Chinese, reply in Chinese. ' +
+    'Never switch languages based on the subject matter, only based on what language the user used.',
+  );
+
+  // Hardcoded tool format rules
+  parts.push(
+    'IMPORTANT: The ONLY way to run code or execute commands is by wrapping bash commands in <execute_bash> tags, like this:\n' +
+    '<execute_bash>echo "hello"</execute_bash>\n\n' +
+    'NEVER use <tool_code> tags. NEVER use Python function calls like schedule_task(...). ' +
+    'These are not supported and will not work. Only <execute_bash> is supported.',
+  );
+
+  // Global CLAUDE.md (all groups, including main)
+  const globalClaudeMdPaths = [
+    '/workspace/global/CLAUDE.md',
+    '/workspace/project/groups/global/CLAUDE.md',
+  ];
+  for (const globalPath of globalClaudeMdPaths) {
+    if (fs.existsSync(globalPath)) {
+      try {
+        const content = fs.readFileSync(globalPath, 'utf-8').trim();
+        if (content) {
+          parts.push(content);
+          break;
+        }
+      } catch { /* skip */ }
+    }
   }
 
   // Group CLAUDE.md
@@ -158,6 +194,16 @@ function buildSystemPrompt(containerInput: ContainerInput): string {
     parts.push('Note: This message was sent automatically as a scheduled task, not directly by a user.');
   }
 
+  // Runtime context
+  const contextLines: string[] = ['## Runtime Context (injected by host)'];
+  if (containerInput.chatJid) {
+    contextLines.push(`- **Current group JID**: \`${containerInput.chatJid}\` — use this as \`targetJid\` when scheduling tasks for this group`);
+  }
+  if (containerInput.groupFolder) {
+    contextLines.push(`- **Group folder**: \`${containerInput.groupFolder}\``);
+  }
+  parts.push(contextLines.join('\n'));
+
   return parts.join('\n\n');
 }
 
@@ -170,12 +216,10 @@ async function runQuery(
   history: any[],
   provider: GeminiProvider,
 ): Promise<{ replyText: string; closedDuringQuery: boolean }> {
-  // Check close before starting
   if (shouldClose()) {
     return { replyText: '', closedDuringQuery: true };
   }
 
-  // Build the full contents array: history + new user message
   const contents = [
     ...history,
     { role: 'user', parts: [{ text: userText }] },
@@ -183,7 +227,6 @@ async function runQuery(
 
   log(`Calling Provider API (history turns: ${history.length}, prompt length: ${userText.length})`);
 
-  // Race: Provider API call vs _close sentinel poll
   let closedDuringQuery = false;
   let closeCheckInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -198,7 +241,6 @@ async function runQuery(
     }, IPC_POLL_MS);
   });
 
-  // Wait for API (close detection is best-effort; we finish the request regardless)
   const apiResult = await Promise.race([
     apiPromise.then(r => r),
     closePromise.then(() => null),
@@ -206,14 +248,12 @@ async function runQuery(
 
   if (closeCheckInterval) clearInterval(closeCheckInterval);
 
-  // If closed before API returned, still try to get the result if it resolved
   let replyText = '';
   if (apiResult !== null) {
     const result = apiResult as Awaited<typeof apiPromise>;
     replyText = result.content;
     log(`Provider response received (${replyText.length} chars)`);
   } else {
-    // Try to get result from already-pending promise
     try {
       const result = await apiPromise;
       replyText = result.content;
@@ -243,7 +283,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Read Gemini credentials from secrets (forwarded by container-runner.ts)
   const apiKey = containerInput.secrets?.GOOGLE_API_KEY || process.env.GOOGLE_API_KEY;
   const modelName = containerInput.secrets?.NANO_MODEL || process.env.NANO_MODEL || 'gemini-2.0-flash';
 
@@ -263,11 +302,8 @@ async function main(): Promise<void> {
   const provider = new GeminiProvider(apiKey, modelName);
   
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
-
-  // Clean up stale _close sentinel from previous container runs
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
 
-  // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
   if (containerInput.isScheduledTask) {
     prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
@@ -283,22 +319,52 @@ async function main(): Promise<void> {
     prompt += '\n' + pending.join('\n');
   }
 
-  // In-memory multi-turn history (persists across IPC turns within this container lifetime)
   const history: any[] = [];
 
-  // Query loop: send prompt → append turn to history → wait for IPC → repeat
   try {
+    let currentPrompt = prompt;
     while (true) {
       log(`Starting Provider query (history turns: ${history.length})...`);
 
-      const { replyText, closedDuringQuery } = await runQuery(prompt, history, provider);
+      const { replyText, closedDuringQuery } = await runQuery(currentPrompt, history, provider);
 
-      // Append this turn to history for context continuity
-      if (prompt) {
-        history.push({ role: 'user', parts: [{ text: prompt }] });
+      // Append user turn to history
+      if (currentPrompt) {
+        history.push({ role: 'user', parts: [{ text: currentPrompt }] });
       }
-      if (replyText) {
-        history.push({ role: 'model', parts: [{ text: replyText }] });
+      
+      let finalReply = replyText;
+      let iteration = 0;
+      const MAX_ITERATIONS = 5;
+
+      // Tool execution loop
+      while (iteration < MAX_ITERATIONS) {
+        const bashMatch = finalReply.match(/<execute_bash>([\s\S]*?)<\/execute_bash>/);
+        if (!bashMatch) break;
+
+        iteration++;
+        const command = bashMatch[1].trim();
+        
+        // Append model turn (with tool call) to history
+        history.push({ role: 'model', parts: [{ text: finalReply }] });
+
+        const { output, exitCode } = await executeBash(command);
+        const observation = `<bash_result exit_code="${exitCode}">${output}</bash_result>`;
+        
+        log(`Bash output (${output.length} chars), re-calling Provider...`);
+        
+        const { replyText: nextReply, closedDuringQuery: closedInTool } = await runQuery(observation, history, provider);
+        
+        // Append observation turn to history
+        history.push({ role: 'user', parts: [{ text: observation }] });
+        
+        finalReply = nextReply;
+        if (closedInTool) break;
+      }
+
+      // Final model turn to history
+      if (finalReply) {
+        history.push({ role: 'model', parts: [{ text: finalReply }] });
       }
 
       // Truncate history to stay within token limits
@@ -306,10 +372,10 @@ async function main(): Promise<void> {
         history.shift();
       }
 
-      // Emit result (no sessionId — Provider is stateless; we use in-memory history)
+      // Emit result
       writeOutput({
         status: 'success',
-        result: replyText || null,
+        result: finalReply || null,
       });
 
       if (closedDuringQuery) {
@@ -317,7 +383,6 @@ async function main(): Promise<void> {
         break;
       }
 
-      // Emit session-update marker so host can track idle state
       writeOutput({ status: 'success', result: null });
 
       log('Query ended, waiting for next IPC message...');
@@ -329,7 +394,7 @@ async function main(): Promise<void> {
       }
 
       log(`Got new message (${nextMessage.length} chars), starting new query`);
-      prompt = nextMessage;
+      currentPrompt = nextMessage;
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);

@@ -13,6 +13,9 @@ WORKDIR /app
 # This avoids needing internet access during the build process
 COPY agent-runner/ ./
 
+# Install system utilities needed by agent bash scripts
+RUN apt-get update && apt-get install -y --no-install-recommends jq && rm -rf /var/lib/apt/lists/*
+
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 

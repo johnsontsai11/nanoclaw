@@ -25,7 +25,14 @@ export function formatMessages(
 }
 
 export function stripInternalTags(text: string): string {
-  return text.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+  return text
+    .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+    .replace(/<execute_bash>[\s\S]*?<\/execute_bash>/g, '')
+    .replace(/<tool_code>[\s\S]*?<\/tool_code>/g, '')
+    .replace(/<bash_result[^>]*>[\s\S]*?<\/bash_result>/g, '')
+    // Strip raw bash observation blocks sent back to Gemini that may leak to user
+    .replace(/\[bash exit code \d+\][\s\S]*?(?=\n\n|$)/g, '')
+    .trim();
 }
 
 export function formatOutbound(rawText: string): string {

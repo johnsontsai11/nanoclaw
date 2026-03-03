@@ -170,6 +170,18 @@ describe('stripInternalTags', () => {
     );
   });
 
+  it('strips execute_bash tags', () => {
+    expect(
+      stripInternalTags('hello <execute_bash>mkdir test</execute_bash> world'),
+    ).toBe('hello  world');
+  });
+
+  it('strips tool_code tags', () => {
+    expect(
+      stripInternalTags('Here are your tasks:\n<tool_code>print(schedule_task())</tool_code>'),
+    ).toBe('Here are your tasks:');
+  });
+
   it('strips multi-line internal tags', () => {
     expect(
       stripInternalTags('hello <internal>\nsecret\nstuff\n</internal> world'),

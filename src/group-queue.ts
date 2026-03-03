@@ -2,7 +2,7 @@ import { ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR, MAX_CONCURRENT_CONTAINERS } from './config.js';
+import { DATA_DIR, MAX_CONCURRENT_CONTAINERS, RETRY_LIMIT } from './config.js';
 import { logger } from './logger.js';
 
 interface QueuedTask {
@@ -11,7 +11,6 @@ interface QueuedTask {
   fn: () => Promise<void>;
 }
 
-const MAX_RETRIES = 5;
 const BASE_RETRY_MS = 5000;
 
 interface GroupState {
@@ -57,6 +56,10 @@ export class GroupQueue {
 
   setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
     this.processMessagesFn = fn;
+  }
+
+  getRetryCount(groupJid: string): number {
+    return this.getGroup(groupJid).retryCount;
   }
 
   enqueueMessageCheck(groupJid: string): void {
@@ -151,6 +154,14 @@ export class GroupQueue {
     if (state.pendingTasks.length > 0) {
       this.closeStdin(groupJid);
     }
+  }
+
+  /**
+   * Returns true if there is an active container for this group.
+   */
+  isActive(groupJid: string): boolean {
+    const state = this.getGroup(groupJid);
+    return state.active && !state.isTaskContainer;
   }
 
   /**
@@ -262,7 +273,7 @@ export class GroupQueue {
 
   private scheduleRetry(groupJid: string, state: GroupState): void {
     state.retryCount++;
-    if (state.retryCount > MAX_RETRIES) {
+    if (state.retryCount > RETRY_LIMIT) {
       logger.error(
         { groupJid, retryCount: state.retryCount },
         'Max retries exceeded, dropping messages (will retry on next incoming message)',

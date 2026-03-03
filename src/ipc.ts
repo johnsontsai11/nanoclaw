@@ -22,6 +22,7 @@ export interface IpcDeps {
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
   ) => void;
+  refreshTasksSnapshot: (groupFolder: string, isMain: boolean) => void;
 }
 
 let ipcWatcherRunning = false;
@@ -270,6 +271,11 @@ export async function processTaskIpc(
           { taskId, sourceGroup, targetFolder, contextMode },
           'Task created via IPC',
         );
+      } else {
+        logger.warn(
+          { data },
+          'schedule_task IPC missing required fields (prompt, schedule_type, schedule_value, targetJid) — task dropped',
+        );
       }
       break;
 
@@ -278,6 +284,7 @@ export async function processTaskIpc(
         const task = getTaskById(data.taskId);
         if (task && (isMain || task.group_folder === sourceGroup)) {
           updateTask(data.taskId, { status: 'paused' });
+          deps.refreshTasksSnapshot(sourceGroup, isMain);
           logger.info(
             { taskId: data.taskId, sourceGroup },
             'Task paused via IPC',
@@ -296,6 +303,7 @@ export async function processTaskIpc(
         const task = getTaskById(data.taskId);
         if (task && (isMain || task.group_folder === sourceGroup)) {
           updateTask(data.taskId, { status: 'active' });
+          deps.refreshTasksSnapshot(sourceGroup, isMain);
           logger.info(
             { taskId: data.taskId, sourceGroup },
             'Task resumed via IPC',
@@ -314,6 +322,7 @@ export async function processTaskIpc(
         const task = getTaskById(data.taskId);
         if (task && (isMain || task.group_folder === sourceGroup)) {
           deleteTask(data.taskId);
+          deps.refreshTasksSnapshot(sourceGroup, isMain);
           logger.info(
             { taskId: data.taskId, sourceGroup },
             'Task cancelled via IPC',
