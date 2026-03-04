@@ -1,7 +1,10 @@
 import pino from 'pino';
 
+// Decouple from config.js to avoid circular dependency
+const DEFAULT_LOG_LEVEL = process.env.LOG_LEVEL || 'info';
+
 export const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
+  level: DEFAULT_LOG_LEVEL,
   transport: { target: 'pino-pretty', options: { colorize: true } },
 });
 

@@ -1,0 +1,64 @@
+#!/usr/bin/env node
+
+/**
+ * NanoClaw RSS Parser Shim
+ * Fetches RSS feeds and outputs titles as bullet points.
+ * Usage: rss-parser <URL> <filter_regex>
+ */
+
+const url = process.argv[2];
+const filter = process.argv[3] || '';
+
+if (!url) {
+  process.exit(1);
+}
+
+async function run() {
+  try {
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+      signal: AbortSignal.timeout(15000)
+    });
+    
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const xml = await response.text();
+    
+    const items = xml.split('<item>').slice(1);
+    const parsedItems = items.map(item => {
+        const titleMatch = item.match(/<title>([\s\S]*?)<\/title>/);
+        let linkMatch = item.match(/<link>([\s\S]*?)<\/link>/);
+        
+        // Some feeds use <link href="..."/> format (Atom/RSS hybrid)
+        if (!linkMatch) {
+            linkMatch = item.match(/<link[^>]*href=["']([^"']*)["']/);
+        }
+
+        if (!titleMatch) return null;
+
+        let title = titleMatch[1].replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').trim();
+        let link = linkMatch ? linkMatch[1].replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').trim() : '';
+
+        // Basic entity decoding
+        title = title.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+        
+        return { title, link };
+      })
+      .filter(item => {
+        if (!item || !item.title) return false;
+        if (filter && new RegExp(filter, 'i').test(item.title)) return false;
+        return true;
+      })
+      .slice(0, 5);
+      
+    if (parsedItems.length === 0) {
+      console.log('• No news articles found at this moment.');
+    } else {
+      console.log(parsedItems.map(item => `- ${item.title}\n  URL: ${item.link}`).join('\n'));
+    }
+  } catch (err) {
+    console.error(`Error fetching RSS: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
+run();

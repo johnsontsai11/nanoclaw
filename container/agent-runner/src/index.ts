@@ -123,12 +123,20 @@ function waitForIpcMessage(): Promise<string | null> {
   });
 }
 
-function executeBash(command: string, chatJid: string): Promise<{ output: string; exitCode: number }> {
+async function executeBash(command: string, chatJid: string): Promise<{ output: string; exitCode: number }> {
+  log(`DEBUG: executeBash calling: ${command}`);
+  
   return new Promise((resolve) => {
+    // Prepend /app/src to PATH so our native shims (rss-parser) are found
+    const env = { 
+      ...process.env, 
+      PATH: `/app/src:${process.env.PATH}`,
+      CHAT_JID: chatJid 
+    };
     log(`Executing bash: ${command}`);
-    // PASS CHAT_JID to the environment so skills (like news-briefing) can use it
     exec(command, {
-      env: { ...process.env, CHAT_JID: chatJid }
+      shell: '/bin/bash',
+      env
     }, (error, stdout, stderr) => {
       const output = stdout + stderr;
       const exitCode = error ? (error.code || 1) : 0;
@@ -157,8 +165,15 @@ function buildSystemPrompt(containerInput: ContainerInput): string {
   parts.push(
     'IMPORTANT: The ONLY way to run code or execute commands is by wrapping bash commands in <execute_bash> tags, like this:\n' +
     '<execute_bash>echo "hello"</execute_bash>\n\n' +
-    'NEVER use <tool_code> tags. NEVER use Python function calls like schedule_task(...). ' +
-    'These are not supported and will not work. Only <execute_bash> is supported.',
+    'ENVIRONMENT: You are running in a Linux container. The following tools are PRE-INSTALLED and MUST be used via <execute_bash>:\n' +
+    '- `curl`, `jq`, `sed`, `grep`, `awk`, `date` (standard Linux utilities)\n' +
+    '- `agent-browser` (utility for web fetching: use `agent-browser open "URL"`)\n' +
+    '- `rss-parser` (utility for news: use `rss-parser "URL" "filter_regex"`)\n' +
+    '- `mcp__nanoclaw__send_message` (utility for sending messages)\n\n' +
+    'You MUST use these tools via <execute_bash> to perform tasks. If a task requires fetching news or RSS feeds, you MUST use `rss-parser`. ' +
+    'NEVER claim that these tools are unavailable, that you cannot access the web, or that you are just an AI without browsing capabilities. ' +
+    'You ARE an advanced agent with full Linux environment access via <execute_bash>.\n\n' +
+    'NEVER use <tool_code> tags. NEVER use Python function calls. Only <execute_bash> is supported.',
   );
 
   // Global CLAUDE.md (all groups, including main)
@@ -325,6 +340,7 @@ async function main(): Promise<void> {
       log(`Starting Provider query (history turns: ${history.length})...`);
 
       const { replyText, closedDuringQuery } = await runQuery(currentPrompt, history, provider);
+      log(`DEBUG: Raw Gemini response: ${replyText}`);
 
       // Append user turn to history
       if (currentPrompt) {
@@ -333,7 +349,7 @@ async function main(): Promise<void> {
       
       let finalReply = replyText;
       let iteration = 0;
-      const MAX_ITERATIONS = 5;
+      const MAX_ITERATIONS = 10;
 
       // Tool execution loop
       while (iteration < MAX_ITERATIONS) {
@@ -342,11 +358,13 @@ async function main(): Promise<void> {
 
         iteration++;
         const command = bashMatch[1].trim();
+        log(`DEBUG: Tool call detected: ${command}`);
         
         // Append model turn (with tool call) to history
         history.push({ role: 'model', parts: [{ text: finalReply }] });
 
         const { output, exitCode } = await executeBash(command, containerInput.chatJid);
+        log(`DEBUG: Tool result (exit ${exitCode}): ${output.slice(0, 50)}...`);
         
         // Wrap observation in a structured tag so Gemini interprets it as a tool result,
         // not as user content to echo back to the user.
@@ -354,7 +372,9 @@ async function main(): Promise<void> {
         
         log(`Bash output (${output.length} chars), re-calling Provider...`);
         
+        // Gemini doesn't have "observation" role, so we use "user" for tool results
         const { replyText: nextReply, closedDuringQuery: closedInTool } = await runQuery(observation, history, provider);
+        log(`DEBUG: Raw Gemini nextReply: ${nextReply}`);
         
         // Append observation turn to history
         history.push({ role: 'user', parts: [{ text: observation }] });

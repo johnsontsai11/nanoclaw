@@ -54,9 +54,31 @@ Keep messages clean and readable for the specific channel.
 
 ---
 
-## Admin Context
+## Daily News Briefing
 
-This is the **main channel**, which has elevated privileges.
+A daily news briefing is scheduled to run automatically every morning. When the user asks to "send the briefing", "preview the briefing report", or similar:
+
+1. **Check the scheduled task** — read `/workspace/ipc/current_tasks.json` to confirm the briefing task exists and is active.
+2. **Check for a saved report** — unless the user asks for a "**fresh**" or "**latest**" report, look in `/workspace/group/daily_reports/` for a file named `briefing-YYYY-MM-DD.md` matching today's date.
+3. **If the report exists** (and "fresh" was not requested) — read it and send its content to the user.
+4. **If no report exists yet** — generate one immediately following the rules below:
+
+   **Generation & Synthesis Rules**:
+   - Always read and follow the synthesis instructions in `/workspace/project/scripts/briefing-prompt.txt`.
+   - **Language Priority**: Summarize everything in **Traditional Chinese**.
+   - **No Hallucination**: Use ONLY extracted data. Include article URLs.
+
+   **Step 1: Fetch**
+   <execute_bash>
+   bash /workspace/project/scripts/generate-briefing.sh
+   </execute_bash>
+
+   **Step 2: Read & Synthesize**
+   - Read the raw news from the file indicated by the script output (e.g., `/workspace/group/daily_reports/raw_briefing_YYYY-MM-DD.txt`).
+   - Follow the **Report Format** defined in `/workspace/project/scripts/briefing-prompt.txt`.
+   - Output the final report as your response.
+   
+---
 
 ## Container Mounts
 

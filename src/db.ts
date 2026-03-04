@@ -150,6 +150,53 @@ export function initDatabase(): void {
 
   // Migrate from JSON files if they exist
   migrateJsonState();
+
+  // Ensure daily briefing prompt is up-to-date
+  migrateDailyBriefingPrompt();
+}
+
+/**
+ * Ensures the daily briefing task uses the latest multi-source prompt
+ * and clears old reports to force a fresh generation.
+ */
+function migrateDailyBriefingPrompt(): void {
+  try {
+    const tasks = getAllTasks();
+    const briefingTasks = tasks.filter(t => 
+      t.schedule_value === '0 8 * * *' || 
+      t.schedule_value === '0 7 * * *' ||
+      t.prompt.includes('WORLD GENERAL') || // Check for the start of the new format
+      t.prompt.includes('每日早報')
+    );
+
+    if (briefingTasks.length === 0) return;
+
+    const promptPath = path.join(STORE_DIR, '..', 'scripts', 'briefing-prompt.txt');
+    if (!fs.existsSync(promptPath)) {
+      logger.warn({ promptPath }, 'Centralized briefing prompt file not found');
+      return;
+    }
+    const newPrompt = fs.readFileSync(promptPath, 'utf8').trim();
+
+    for (const task of briefingTasks) {
+      if (task.prompt !== newPrompt) {
+        logger.info({ taskId: task.id }, 'Migrating briefing task to new multi-source prompt');
+        updateTask(task.id, { prompt: newPrompt });
+        
+        // Also clear the reports cache for this group to force recreation
+        const reportsDir = path.join(STORE_DIR, '..', 'groups', task.group_folder, 'daily_reports');
+        if (fs.existsSync(reportsDir)) {
+          logger.info({ reportsDir }, 'Clearing old daily reports cache');
+          const files = fs.readdirSync(reportsDir);
+          for (const file of files) {
+            fs.unlinkSync(path.join(reportsDir, file));
+          }
+        }
+      }
+    }
+  } catch (err) {
+    logger.error({ err }, 'Failed to migrate daily briefing prompt');
+  }
 }
 
 /** @internal - for tests only. Creates a fresh in-memory database. */
