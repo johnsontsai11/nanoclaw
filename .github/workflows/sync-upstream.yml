@@ -1,0 +1,46 @@
+name: Sync Upstream (NanoClaw Official)
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # 每天凌晨 12 點自動執行一次
+  workflow_dispatch:      # 也可以手動點擊按鈕執行
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Your Fork
+        uses: actions/checkout@v4
+        with:
+          ref: main             # 你的分支名稱
+          fetch-depth: 0
+
+      - name: Setup Git Config
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+
+      - name: Add Upstream and Sync
+        run: |
+          # 建立 upstream 遠端連線，如果已存在則更新 URL
+          git remote add upstream https://github.com/qwibitai/nanoclaw.git || git remote set-url upstream https://github.com/qwibitai/nanoclaw.git
+          git fetch upstream main
+          
+          # 檢查是否有新提交需要合併
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "No new changes from upstream."
+            exit 0
+          fi
+
+          # 嘗試合併官方 main 分支
+          # 使用 --no-edit 避免彈出編輯器，使用 --no-rebase 保持 Commit 紀錄
+          if git merge upstream/main --no-edit; then
+            echo "Successfully merged upstream changes."
+            git push origin main
+          else
+            echo "Conflict detected! Manual intervention required."
+            git merge --abort
+            exit 1
+          fi
