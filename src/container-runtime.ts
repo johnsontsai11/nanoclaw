@@ -12,11 +12,7 @@ import { logger } from './logger.js';
 const envConfig = readEnvFile(['CONTAINER_RUNTIME']);
 
 /** The container runtime binary name. */
-export const CONTAINER_RUNTIME_BIN =
-  process.env.CONTAINER_RUNTIME === 'apple-container' ||
-  envConfig.CONTAINER_RUNTIME === 'apple-container'
-    ? 'container'
-    : 'docker';
+export const CONTAINER_RUNTIME_BIN = 'docker';
 
 /** Hostname containers use to reach the host machine. */
 export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
@@ -109,30 +105,12 @@ export function ensureContainerRuntimeRunning(): void {
 export function cleanupOrphans(): void {
   try {
     let orphans: string[] = [];
-    if (CONTAINER_RUNTIME_BIN === 'container') {
-      // Apple container uses 'list --format json' and doesn't support --filter
-      const output = execSync(
-        `${CONTAINER_RUNTIME_BIN} list --format json`,
-        { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
-      );
-      try {
-        const containers = JSON.parse(output);
-        if (Array.isArray(containers)) {
-          orphans = containers
-            .filter((c: any) => c.status === 'running' && c.configuration?.id?.startsWith('nanoclaw-'))
-            .map((c: any) => c.configuration.id);
-        }
-      } catch (err) {
-        logger.warn({ err }, 'Failed to parse container list JSON');
-      }
-    } else {
-      // Docker uses 'ps' with --filter and Go templates
-      const output = execSync(
-        `${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`,
-        { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
-      );
-      orphans = output.trim().split('\n').filter(Boolean);
-    }
+    // Docker uses 'ps' with --filter and Go templates
+    const output = execSync(
+      `${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`,
+      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
+    );
+    orphans = output.trim().split('\n').filter(Boolean);
 
     for (const name of orphans) {
       try {

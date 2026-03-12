@@ -240,6 +240,9 @@ async function runQuery(
   let closedDuringQuery = false;
   let closeCheckInterval: ReturnType<typeof setInterval> | null = null;
 
+  // We DO NOT pass native tools here. We want Gemini to use the XML tags (<execute_bash>)
+  // as instructed in the system prompt. This ensures compatibility with our
+  // tag-based execution loop while still giving it instructions on what tools exist.
   const apiPromise = provider.chat(contents);
 
   const closePromise = new Promise<void>((resolve) => {
@@ -272,6 +275,10 @@ async function runQuery(
       log('Close detected before Provider response; skipping');
     }
   }
+
+  // CRITICAL: Update history with the turn we just took
+  history.push({ role: 'user', parts: [{ text: userText }] });
+  history.push({ role: 'model', parts: [{ text: replyText }] });
 
   return { replyText, closedDuringQuery };
 }
@@ -309,7 +316,7 @@ async function main(): Promise<void> {
   log(`Using model: ${modelName}`);
   log(`System prompt length: ${systemPrompt.length} chars`);
 
-  const provider = new GeminiProvider(apiKey, modelName);
+  const provider = new GeminiProvider(apiKey, modelName, systemPrompt);
   
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
@@ -319,10 +326,6 @@ async function main(): Promise<void> {
     prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
   }
   
-  if (systemPrompt) {
-    prompt = `System Instructions:\n${systemPrompt}\n\nUser Request:\n${prompt}`;
-  }
-  
   const pending = drainIpcInput();
   if (pending.length > 0) {
     log(`Draining ${pending.length} pending IPC messages into initial prompt`);
@@ -330,20 +333,15 @@ async function main(): Promise<void> {
   }
 
   const history: any[] = [];
+  let currentPrompt = prompt;
 
   try {
-    let currentPrompt = prompt;
     while (true) {
       log(`Starting Provider query (history turns: ${history.length})...`);
-
-      const { replyText, closedDuringQuery } = await runQuery(currentPrompt, history, provider);
-      log(`DEBUG: Raw Gemini response: ${replyText}`);
-
-      // Append user turn to history
-      if (currentPrompt) {
-        history.push({ role: 'user', parts: [{ text: currentPrompt }] });
-      }
       
+      const { replyText, closedDuringQuery } = await runQuery(currentPrompt, history, provider);
+      if (closedDuringQuery) break;
+
       let finalReply = replyText;
       let iteration = 0;
       const MAX_ITERATIONS = 10;
@@ -357,9 +355,6 @@ async function main(): Promise<void> {
         const command = bashMatch[1].trim();
         log(`DEBUG: Tool call detected: ${command}`);
         
-        // Append model turn (with tool call) to history
-        history.push({ role: 'model', parts: [{ text: finalReply }] });
-
         const { output, exitCode } = await executeBash(command, containerInput.chatJid);
         log(`DEBUG: Tool result (exit ${exitCode}): ${output.slice(0, 50)}...`);
         
@@ -373,17 +368,11 @@ async function main(): Promise<void> {
         const { replyText: nextReply, closedDuringQuery: closedInTool } = await runQuery(observation, history, provider);
         log(`DEBUG: Raw Gemini nextReply: ${nextReply}`);
         
-        // Append observation turn to history
-        history.push({ role: 'user', parts: [{ text: observation }] });
-        
         finalReply = nextReply;
         if (closedInTool) break;
       }
 
-      // Final model turn to history
-      if (finalReply) {
-        history.push({ role: 'model', parts: [{ text: finalReply }] });
-      }
+      // Final result emitted after any tool loops
 
       // Truncate history to stay within token limits
       while (history.length > MAX_HISTORY_TURNS) {

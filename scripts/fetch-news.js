@@ -70,7 +70,11 @@ async function fetchRSS(url, filter) {
         ?.replace(/&#39;/g, "'")
         ?.trim() || "No Title";
       
-      const link = item.match(/<link>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/link>/s)?.[1]?.trim() || "No Link";
+      let link = item.match(/<link>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/link>/s)?.[1]?.trim();
+      if (!link) {
+        link = item.match(/<link[^>]*href=["']([^"']*)["']/)?.[1]?.trim();
+      }
+      link = link || "No Link";
       
       // Extract description or content:encoded for richness
       let description = item.match(/<(?:description|content:encoded)>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/(?:description|content:encoded)>/s)?.[1] || "";
@@ -88,7 +92,7 @@ async function fetchRSS(url, filter) {
         .trim();
 
       if (!filter || !new RegExp(filter, 'i').test(title)) {
-        results.push(`- Title: ${title}\n  Published: ${new Date(pubTime).toLocaleString()}\n  Summary Context: ${description.slice(0, 1000)}\n  URL: ${link}`);
+        results.push(`### ITEM START ###\n- Title: ${title}\n  Published: ${new Date(pubTime).toLocaleString()}\n  URL: ${link}\n  Summary Context: ${description.slice(0, 1000)}\n### ITEM END ###`);
       }
     }
     return results.join('\n\n');
@@ -99,11 +103,24 @@ async function fetchRSS(url, filter) {
 
 async function main() {
   console.log(`Current Time: ${new Date().toLocaleString()}\n`);
+  const seenTitles = new Set();
   for (const [section, feedList] of Object.entries(SOURCES)) {
     console.log(`=== ${section} ===`);
     for (const [url, filter] of feedList) {
       const output = await fetchRSS(url, filter);
-      if (output) console.log(output);
+      if (output) {
+        const items = output.split('\n\n');
+        for (const item of items) {
+          const titleMatch = item.match(/- Title: (.*)/);
+          if (titleMatch) {
+            const title = titleMatch[1].trim();
+            if (!seenTitles.has(title)) {
+              seenTitles.add(title);
+              console.log(item + '\n');
+            }
+          }
+        }
+      }
     }
     console.log('');
   }

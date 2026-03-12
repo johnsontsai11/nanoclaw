@@ -176,7 +176,8 @@ function migrateDailyBriefingPrompt(): void {
       logger.warn({ promptPath }, 'Centralized briefing prompt file not found');
       return;
     }
-    const newPrompt = fs.readFileSync(promptPath, 'utf8').trim();
+    const briefingRules = fs.readFileSync(promptPath, 'utf8').trim();
+    const newPrompt = `<execute_bash>\nbash /workspace/project/scripts/generate-briefing.sh\n</execute_bash>\n\n${briefingRules}`;
 
     for (const task of briefingTasks) {
       if (task.prompt !== newPrompt) {

@@ -19,4 +19,7 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "Step 2: Raw news fetched to $RAW_FILE."
-echo "Please now read $RAW_FILE and $PROMPT_FILE to synthesize the report."
+cat "$RAW_FILE"
+echo "--- END RAW NEWS ---"
+echo "### CRITICAL: FOLLOW THESE INSTRUCTIONS FROM $PROMPT_FILE EXACTLY ###"
+cat "$PROMPT_FILE"
