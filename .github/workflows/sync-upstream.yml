@@ -17,7 +17,7 @@ jobs:
     steps:
       - name: Checkout Your Fork
         # 建議檢查是否有 v5，若無則繼續使用 v4 但搭配上面的 env 變數
-        uses: actions/checkout@v4 
+        uses: actions/checkout@v5 
         with:
           ref: main
           fetch-depth: 0
