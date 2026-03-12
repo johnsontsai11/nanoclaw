@@ -239,6 +239,7 @@ async function runTask(
 }
 
 let schedulerRunning = false;
+const currentlyRunningTasks = new Set<string>();
 
 export function startSchedulerLoop(deps: SchedulerDependencies): void {
   if (schedulerRunning) {
@@ -262,9 +263,20 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           continue;
         }
 
-        deps.queue.enqueueTask(currentTask.chat_jid, currentTask.id, () =>
-          runTask(currentTask, deps),
-        );
+        // Prevent running the same task multiple times concurrently
+        if (currentlyRunningTasks.has(task.id)) {
+          logger.debug({ taskId: task.id }, 'Task already running, skipping');
+          continue;
+        }
+
+        currentlyRunningTasks.add(task.id);
+        deps.queue.enqueueTask(currentTask.chat_jid, currentTask.id, async () => {
+          try {
+            await runTask(currentTask, deps);
+          } finally {
+            currentlyRunningTasks.delete(task.id);
+          }
+        });
       }
     } catch (err) {
       logger.error({ err }, 'Error in scheduler loop');

@@ -8,6 +8,8 @@ STRICTLY IGNORE AND EXCLUDE:
 - Local minor accidents, traffic incidents, or individual crimes.
 - Opinion pieces, editorials, or political talk-show summaries.
 - STRICTLY EXCLUDE any "紅媒" (Red Media) sources like "旺旺", "中時", "工商時報", "CTiTV".
+- STRICTLY EXCLUDE awards, competitions, or generic corporate PR (e.g., "太空站機器人程式挑戰賽", "OOO獲獎", "OOO簽署備忘錄").
+- EXCLUDE start-up pitch events or minor local community tech events.
 
 STEP 1: Fetch news using robust wrapper.
 <execute_bash>
@@ -16,35 +18,51 @@ bash /workspace/project/scripts/generate-briefing.sh
 
 STEP 2: Synthesize a WhatsApp report.
 - **Critical**: Summarize everything in **Traditional Chinese**.
-- **Crucial**: Include the URL for EVERY item as shown below.
+- **Crucial**: Use the provided `Summary Context` to write **Insightful, Professional Summaries**.
+- **Quality Rule**: DO NOT just rewrite the headline. Provide 2-3 sentences of actual substance. Explain *why* this news matters to the industry or market.
+- **Item Block**: Each news item MUST be a single cohesive block: Headline -> Detailed Summary -> Related Stocks (if any) -> Link.
+- **Related Stocks**: For all financial and market news, identify relevant stock ticker symbols (e.g., AAPL, TSLA, 2330.TW, 0050.TW). If multiple, list them separated by commas.
+- **Forbidden**: No "advertorial" style clickbait. No generic one-liners.
+- **Count**: Provide AT LEAST 5 items for each category.
 
-**Report Format:**
+**Report Format (Follow Exactly):**
 *每日早報: 全球視野與市場動態*
+[Date: YYYY-MM-DD]
 
 *【國際頭條】 (World General)*
-• *[Chinese Headline]* - [Summary]
+• *[Headline in Chinese]*
+  [Concise 1-2 sentence summary in Traditional Chinese]
   🔗 [URL]
-(Select 4-5 headlines)
+
+• *[Headline 2]*
+  [Summary 2]
+  🔗 [URL 2]
+(Provide at least 5 items)
 
 *【台灣焦點】 (Taiwan General)*
-• *[Chinese Headline]* - [Summary]
+• *[Headline]*
+  [Summary]
   🔗 [URL]
-(Select 4-5 headlines)
+(Provide at least 5 items)
 
 *【國際財經與行銷】 (World Finance & Marketing)*
-• *[Chinese Headline]* - [Summary]
+• *[Headline]*
+  [Summary]
+  📈 [Related Stocks: TICKER1, TICKER2]
   🔗 [URL]
-(Select 5-6 headlines - priority to marketing/tech)
+(Provide at least 5 items - focus on marketing/tech)
 
 *【台灣市場動態】 (Taiwan Tech/Finance)*
-• *[Chinese Headline]* - [Summary]
+• *[Headline]*
+  [Summary]
+  📈 [Related Stocks: TICKER.TW, ...]
   🔗 [URL]
-(Select 4-5 headlines)
+(Provide at least 5 items)
 
 *【🔥 市場趨勢與展望】*
-1️⃣ *[Trend]* - [Analysis]
-2️⃣ *[Trend]* - [Analysis]
+1️⃣ *[Trend Name]*: [Deep Analysis] (Related Stocks: TICKER, TICKER)
+2️⃣ *[Trend Name]*: [Deep Analysis] (Related Stocks: TICKER, TICKER)
 
 *【📉 市場動向預測：明日亮點】*
-• *潛力板塊：* [Rising sectors].
-• *展望摘要：* [Brief forecast].
+• *潛力板塊：* [Specific rising sectors] (Key Stocks: TICKER, TICKER).
+• *展望摘要：* [Actionable brief forecast].

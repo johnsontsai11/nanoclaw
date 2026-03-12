@@ -168,11 +168,8 @@ function buildSystemPrompt(containerInput: ContainerInput): string {
     'ENVIRONMENT: You are running in a Linux container. The following tools are PRE-INSTALLED and MUST be used via <execute_bash>:\n' +
     '- `curl`, `jq`, `sed`, `grep`, `awk`, `date` (standard Linux utilities)\n' +
     '- `agent-browser` (utility for web fetching: use `agent-browser open "URL"`)\n' +
-    '- `rss-parser` (utility for news: use `rss-parser "URL" "filter_regex"`)\n' +
     '- `mcp__nanoclaw__send_message` (utility for sending messages)\n\n' +
-    'You MUST use these tools via <execute_bash> to perform tasks. If a task requires fetching news or RSS feeds, you MUST use `rss-parser`. ' +
-    'NEVER claim that these tools are unavailable, that you cannot access the web, or that you are just an AI without browsing capabilities. ' +
-    'You ARE an advanced agent with full Linux environment access via <execute_bash>.\n\n' +
+    'You MUST use these tools via <execute_bash> to perform tasks.\n\n' +
     'NEVER use <tool_code> tags. NEVER use Python function calls. Only <execute_bash> is supported.',
   );
 
