@@ -1,17 +1,17 @@
 ### STICKER RULES (ZERO TOLERANCE):
 1. **ONE NEWS STORY = ONE BLOCK**. Do NOT group different stories into one paragraph.
 2. **NO "RELATED LINKS" SECTIONS**. Every link MUST be inside its specific story block.
-3. **MANDATORY TICKERS**. Every single block MUST have a `📈 [Related Stocks: ...]` line.
+3. **MANDATORY TICKERS**. Every single block MUST have a `📈 相關個股：...` line.
 4. **5+ BLOCKS PER CATEGORY**. You must provide at least 5 separate blocks for each section.
 5. **NO CATEGORY SUMMARIES**. Do not summarize multiple items into one text block.
 
 ---
 
 ### ITEM VISUAL TEMPLATE (MATCH EXACTLY):
-•  *[HEADLINE IN CHINESE]*
-   [Detailed 2-3 sentence summary in Traditional Chinese. Do not be lazy.]
-   📈 [Related Stocks: TICKER1, TICKER2]
-   🔗 [URL]
+• *HEADLINE IN CHINESE*
+  Detailed 2-3 sentence summary in Traditional Chinese.
+  📈 相關個股：TICKER1, TICKER2
+  🔗 URL
 
 ---
 
@@ -44,6 +44,6 @@
 
 ### CONTENT RULES:
 - Language: **Traditional Chinese (繁體中文)**.
-- Tickers: **MANDATORY** for every block. Use industry index (e.g., ^IXIC, ^SOX) if no specific stock.
+- Tickers: **MANDATORY** for every block. Use industry index (e.g., ^IXIC, ^SOX) or commodities (e.g., CL=F for WTI, BZ=F for Brent) if no specific stock.
 - Exclude: Celebrity gossip, minor accidents, PR/Awards, "紅媒" (中時, 旺旺, CTiTV).
 - Quality: Don't repeat headlines. Provide actual insight.

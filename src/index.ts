@@ -57,6 +57,8 @@ import {
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { ExecutorState, processGroupMessages } from './agent-executor.js';
+import { recoverPendingMessages, startMessageLoop } from './message-loop.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -69,11 +71,22 @@ let messageLoopRunning = false;
 
 // Tracks when the last "Got it..." ack was sent per chat, to prevent duplicates.
 const lastAckSentAt = new Map<string, number>();
-const ACK_COOLDOWN_MS = 60_000; // 1 minute
 const busyChats = new Set<string>(); // Tracks which chats are currently "thinking"
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+
+// Create the shared executor state
+const executorState: ExecutorState = {
+  get lastAgentTimestamp() { return lastAgentTimestamp; },
+  get sessions() { return sessions; },
+  get registeredGroups() { return registeredGroups; },
+  channels,
+  queue,
+  busyChats,
+  lastAckSentAt,
+  saveState,
+};
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -146,412 +159,6 @@ export function _setRegisteredGroups(
   registeredGroups = groups;
 }
 
-/**
- * Process all pending messages for a group.
- * Called by the GroupQueue when it's this group's turn.
- */
-async function processGroupMessages(chatJid: string): Promise<boolean> {
-  const group = registeredGroups[chatJid];
-  if (!group) return true;
-
-  const channel = findChannel(channels, chatJid);
-  if (!channel) {
-    logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
-    return true;
-  }
-
-  const isMainGroup = group.isMain === true;
-
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-  let missedMessages = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
-
-  if (missedMessages.length === 0) return true;
-
-  // Backlog safety: If we have an overwhelming number of missed messages,
-  // skip the old ones and only process the most recent context to avoid
-  // exploding the Token count (TPM) and hitting 429 errors.
-  const BACKLOG_THRESHOLD = 10;
-  if (missedMessages.length > BACKLOG_THRESHOLD) {
-    logger.warn(
-      { jid: chatJid, totalMissed: missedMessages.length },
-      `Backlog too large, truncating to most recent ${BACKLOG_THRESHOLD} messages`
-    );
-    missedMessages = missedMessages.slice(-BACKLOG_THRESHOLD);
-  }
-
-  // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
-    const allowlistCfg = loadSenderAllowlist();
-    const hasTrigger = missedMessages.some(
-      (m) =>
-        TRIGGER_PATTERN.test(m.content.trim()) &&
-        (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
-    );
-    if (!hasTrigger) return true;
-  }
-
-  const prompt = formatMessages(missedMessages, TIMEZONE);
-
-  // Advance cursor so the piping path in startMessageLoop won't re-fetch
-  // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
-  saveState();
-
-  logger.info(
-    { group: group.name, messageCount: missedMessages.length },
-    'Processing messages',
-  );
-
-  // Track idle timer for closing stdin when agent is idle
-  let idleTimer: ReturnType<typeof setTimeout> | null = null;
-
-  const resetIdleTimer = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      logger.debug(
-        { group: group.name },
-        'Idle timeout, closing container stdin',
-      );
-      queue.closeStdin(chatJid);
-    }, IDLE_TIMEOUT);
-  };
-
-  await channel.setTyping?.(chatJid, true);
-  busyChats.add(chatJid);
-  // Reset the cooldown timer whenever processing starts fresh, so stale
-  // timestamps from previous long-running tasks don't cause "Still working on it..."
-  // to fire immediately for a quick follow-up query.
-  lastAckSentAt.set(chatJid, Date.now());
-
-  // Periodically send "Still working on it..." during long-running tasks.
-  // Checks every 10s if we are busy and if a minute has passed since the last interaction.
-  const progressInterval = setInterval(() => {
-    if (!busyChats.has(chatJid)) return;
-    
-    const now = Date.now();
-    const last = lastAckSentAt.get(chatJid) ?? 0;
-    if (now - last >= ACK_COOLDOWN_MS) {
-      lastAckSentAt.set(chatJid, now);
-      logger.info({ chatJid }, 'Sending periodic progress update');
-      channel.sendMessage(chatJid, 'Still working on it...').catch(() => {});
-    }
-  }, 10_000);
-
-  let hadError = false;
-  let outputSentToUser = false;
-
-  try {
-    const output = await runAgent(group, prompt, chatJid, async (result) => {
-      // Streaming output callback — called for each agent result
-      if (result.result) {
-        busyChats.add(chatJid);
-        const raw =
-          typeof result.result === 'string'
-            ? result.result
-            : JSON.stringify(result.result);
-        // Strip internal/tool tags using shared formatOutbound
-        const text = formatOutbound(raw);
-        logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
-        if (text) {
-          // Fire and forget send message so it doesn't block container cleanup
-          channel.sendMessage(chatJid, text).catch((err) =>
-            logger.warn({ chatJid, err }, 'Failed to send agent streaming output'),
-          );
-          outputSentToUser = true;
-        }
-        // Only reset idle timer on actual results, not session-update markers (result: null)
-        resetIdleTimer();
-      }
-
-      if (result.status === 'success') {
-        if (result.result === null) {
-          // Turn completed, waiting for IPC
-          busyChats.delete(chatJid);
-        }
-        queue.notifyIdle(chatJid);
-      }
-
-      if (result.status === 'error') {
-        hadError = true;
-        busyChats.delete(chatJid);
-        
-        if (result.error && result.error.includes('429 Too Many Requests') && result.error.includes('Quota exceeded')) {
-          const currentRetries = queue.getRetryCount(chatJid);
-          if (currentRetries >= RETRY_LIMIT) {
-            channel.sendMessage(
-              chatJid,
-              `❌ *API Quota Limit* still exceeded after multiple retries. I've stopped trying for now. Please ask again later.`
-            ).catch(() => {});
-          } else {
-            const nextDelaySecs = Math.round((5000 * Math.pow(2, currentRetries)) / 1000);
-            channel.sendMessage(
-              chatJid,
-              `⚠️ *API Quota Limit Reached*\nGoogle says I'm thinking too fast right now. I will automatically try again quietly in ${nextDelaySecs} seconds.`
-            ).catch(() => {});
-          }
-        } else if (result.error && (result.error.includes('API key expired') || result.error.includes('api key not found') || result.error.includes('API_KEY_INVALID'))) {
-          channel.sendMessage(
-            chatJid,
-            `❌ *Invalid API Key!*\n\nGoogle is reporting that your API key is expired or invalid. Please update your \`GOOGLE_API_KEY\` in the \`.env\` file and run \`./restart.sh\`.`
-          ).catch(() => {});
-        }
-      }
-    });
-
-    if (output === 'error' || hadError) {
-      // If we already sent output to the user, don't roll back the cursor —
-      // the user got their response and re-processing would send duplicates.
-      if (outputSentToUser) {
-        logger.warn(
-          { group: group.name },
-          'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
-        );
-        return true;
-      }
-      // Roll back cursor so retries can re-process these messages
-      lastAgentTimestamp[chatJid] = previousCursor;
-      saveState();
-      logger.warn(
-        { group: group.name },
-        'Agent error, rolled back message cursor for retry',
-      );
-      return false;
-    }
-  } catch (err) {
-    logger.error({ group: group.name, err }, 'Critical error in processGroupMessages');
-    return false;
-  } finally {
-    await channel.setTyping?.(chatJid, false);
-    busyChats.delete(chatJid);
-    clearInterval(progressInterval);
-    if (idleTimer) clearTimeout(idleTimer);
-  }
-
-  return true;
-}
-
-async function runAgent(
-  group: RegisteredGroup,
-  prompt: string,
-  chatJid: string,
-  onOutput?: (output: ContainerOutput) => Promise<void>,
-): Promise<'success' | 'error'> {
-  const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
-
-  // Update tasks snapshot for container to read (filtered by group)
-  const tasks = getAllTasks();
-  writeTasksSnapshot(
-    group.folder,
-    isMain,
-    tasks.map((t) => ({
-      id: t.id,
-      groupFolder: t.group_folder,
-      prompt: t.prompt,
-      schedule_type: t.schedule_type,
-      schedule_value: t.schedule_value,
-      status: t.status,
-      next_run: t.next_run,
-    })),
-  );
-
-  // Update available groups snapshot (main group only can see all groups)
-  const availableGroups = getAvailableGroups();
-  writeGroupsSnapshot(
-    group.folder,
-    isMain,
-    availableGroups,
-    new Set(Object.keys(registeredGroups)),
-  );
-
-  // Wrap onOutput to track session ID from streamed results
-  const wrappedOnOutput = onOutput
-    ? async (output: ContainerOutput) => {
-        if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
-        }
-        await onOutput(output);
-      }
-    : undefined;
-
-  try {
-    const output = await runContainerAgent(
-      group,
-      {
-        prompt,
-        sessionId,
-        groupFolder: group.folder,
-        chatJid,
-        isMain,
-        assistantName: ASSISTANT_NAME,
-      },
-      (proc, containerName) =>
-        queue.registerProcess(chatJid, proc, containerName, group.folder),
-      wrappedOnOutput,
-    );
-
-    if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
-    }
-
-    if (output.status === 'error') {
-      logger.error(
-        { group: group.name, error: output.error },
-        'Container agent error',
-      );
-      return 'error';
-    }
-
-    return 'success';
-  } catch (err) {
-    logger.error({ group: group.name, err }, 'Agent error');
-    return 'error';
-  }
-}
-
-async function startMessageLoop(): Promise<void> {
-  if (messageLoopRunning) {
-    logger.debug('Message loop already running, skipping duplicate start');
-    return;
-  }
-  messageLoopRunning = true;
-
-  logger.info(`NanoClaw running (trigger: @${ASSISTANT_NAME})`);
-
-  while (true) {
-    try {
-      const jids = Object.keys(registeredGroups);
-      const { messages, newTimestamp } = getNewMessages(
-        jids,
-        lastTimestamp,
-        ASSISTANT_NAME,
-      );
-
-      if (messages.length > 0) {
-        logger.info({ count: messages.length }, 'New messages');
-
-        // Advance the "seen" cursor for all messages immediately
-        lastTimestamp = newTimestamp;
-        saveState();
-
-        // Deduplicate by group
-        const messagesByGroup = new Map<string, NewMessage[]>();
-        for (const msg of messages) {
-          const existing = messagesByGroup.get(msg.chat_jid);
-          if (existing) {
-            existing.push(msg);
-          } else {
-            messagesByGroup.set(msg.chat_jid, [msg]);
-          }
-        }
-
-        for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
-          if (!group) continue;
-
-          const channel = findChannel(channels, chatJid);
-          if (!channel) {
-            logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
-            continue;
-          }
-
-          const isMainGroup = group.isMain === true;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
-
-          // For non-main groups, only act on trigger messages.
-          // Non-trigger messages accumulate in DB and get pulled as
-          // context when a trigger eventually arrives.
-          if (needsTrigger) {
-            const allowlistCfg = loadSenderAllowlist();
-            const hasTrigger = groupMessages.some(
-              (m) =>
-                TRIGGER_PATTERN.test(m.content.trim()) &&
-                (m.is_from_me ||
-                  isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
-            );
-            if (!hasTrigger) continue;
-          }
-
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
-            chatJid,
-            lastAgentTimestamp[chatJid] || '',
-            ASSISTANT_NAME,
-          );
-          const messagesToSend =
-            allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend, TIMEZONE);
-
-          // Send an immediate acknowledgment that the message was received.
-          const now = Date.now();
-          const lastAck = lastAckSentAt.get(chatJid) ?? 0;
-          const isBusy = queue.isActive(chatJid);
-
-          if (isBusy && (now - lastAck > ACK_COOLDOWN_MS)) {
-            // Delay the ack by 5s — if the response arrives faster (common for simple
-            // queries) the timeout will be cancelled before it ever fires.
-            lastAckSentAt.set(chatJid, now);
-            setTimeout(() => {
-              // Only send if still busy by the time the delay fires
-              if (queue.isActive(chatJid)) {
-                channel.sendMessage(
-                  chatJid,
-                  'Got the new input! Still working on the current task...'
-                ).catch(() => {});
-              }
-            }, 5000);
-          }
-
-          if (queue.sendMessage(chatJid, formatted)) {
-            busyChats.add(chatJid);
-            logger.debug(
-              { chatJid, count: messagesToSend.length },
-              'Piped messages to active container',
-            );
-            lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
-            saveState();
-            // Show typing indicator while the container processes the piped message
-            channel
-              .setTyping?.(chatJid, true)
-              ?.catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
-              );
-          } else {
-            // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
-          }
-        }
-      }
-    } catch (err) {
-      logger.error({ err }, 'Error in message loop');
-    }
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
-  }
-}
-
-/**
- * Startup recovery: check for unprocessed messages in registered groups.
- * Handles crash between advancing lastTimestamp and processing messages.
- */
-function recoverPendingMessages(): void {
-  for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-    const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
-    if (pending.length > 0) {
-      logger.info(
-        { group: group.name, pendingCount: pending.length },
-        'Recovery: found unprocessed messages',
-      );
-      queue.enqueueMessageCheck(chatJid);
-    }
-  }
-}
 
 function ensureContainerSystemRunning(): void {
   ensureContainerRuntimeRunning();
@@ -687,9 +294,15 @@ async function main(): Promise<void> {
       );
     },
   });
-  queue.setProcessMessagesFn(processGroupMessages);
-  recoverPendingMessages();
-  startMessageLoop().catch((err) => {
+  queue.setProcessMessagesFn((jid) => processGroupMessages(jid, executorState));
+  recoverPendingMessages(executorState);
+  startMessageLoop(executorState, {
+    get messageLoopRunning() { return messageLoopRunning; },
+    set messageLoopRunning(v) { messageLoopRunning = v; },
+    get lastTimestamp() { return lastTimestamp; },
+    set lastTimestamp(v) { lastTimestamp = v; },
+    saveState,
+  }).catch((err) => {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');
     process.exit(1);
   });
